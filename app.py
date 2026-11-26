@@ -204,6 +204,21 @@ def format_label(name):
     return name.replace("___", " - ").replace("__", " - ").replace("_", " ")
 
 
+def is_plant_leaf(pil_image, min_foliage_ratio=0.08):
+    """
+    Lightweight HSV color-space validator to reject obvious non-leaf images
+    (e.g., faces, indoor rooms, walls, documents) before running the model.
+    """
+    hsv_img = pil_image.resize((128, 128)).convert("HSV")
+    hsv_arr = np.array(hsv_img)
+    h, s, v = hsv_arr[:, :, 0], hsv_arr[:, :, 1], hsv_arr[:, :, 2]
+
+    # Plant foliage hues in PIL HSV (0-255): yellow-green to deep green
+    foliage_mask = (h >= 28) & (h <= 115) & (s >= 35) & (v >= 30) & (v <= 245)
+    foliage_ratio = np.mean(foliage_mask)
+    return foliage_ratio >= min_foliage_ratio
+
+
 # 6. Compact Header with Custom SVG Leaf Logo + Top-Right Model Info Popover
 header_left, header_right = st.columns([5, 1], vertical_alignment="center")
 
@@ -300,27 +315,6 @@ elif sample_files and selected_sample != "-- Select a sample leaf --":
 
 # 10. Main Side-by-Side Result Area OR Empty-State 3-Step Guide
 if image is not None:
-    # Exact same preprocessing & prediction logic as before
-    img_resized = image.resize((128, 128))
-    img_array = np.array(img_resized, dtype=np.float32)
-    img_array = np.expand_dims(img_array, axis=0)
-
-    with st.spinner("Analyzing leaf..."):
-        preds = model.predict(img_array, verbose=0)[0]
-
-    top_3_indices = np.argsort(preds)[-3:][::-1]
-    best_raw_name = CLASS_NAMES[top_3_indices[0]]
-    best_name = format_label(best_raw_name)
-    best_conf = preds[top_3_indices[0]] * 100
-    is_healthy = "healthy" in best_raw_name.lower()
-    details = DISEASE_INFO.get(
-        best_raw_name,
-        {
-            "info": "No additional description available.",
-            "tip": "Consult a local agricultural extension for detailed guidance.",
-        },
-    )
-
     left_col, right_col = st.columns([1, 1.3], gap="large")
 
     # Left Card: Clean, reasonably sized image preview
@@ -330,65 +324,96 @@ if image is not None:
             preview.thumbnail((340, 300))
             st.image(preview, caption=image_caption)
 
-    # Right Card: Smart Diagnosis + Top 3 Bars + Care Tip + Download Report
+    # Right Card: Validate leaf image BEFORE running the disease model
     with right_col:
         with st.container(border=True):
-            st.markdown("#### Diagnosis Result")
-
-            if is_healthy:
-                st.success(
-                    f"**Healthy:** {best_name} ({best_conf:.2f}% confidence)",
-                    icon=":material/check_circle:",
+            if not is_plant_leaf(image):
+                st.markdown("#### Invalid Image Detected")
+                st.warning(
+                    "This image does not appear to be a plant leaf. Please upload or capture a clear, close-up photo of a **Pepper, Potato, or Tomato leaf**.",
+                    icon=":material/error:",
+                )
+                st.caption(
+                    "Tip: Make sure the leaf fills a clear portion of the frame with good lighting."
                 )
             else:
-                st.error(
-                    f"**Disease Detected:** {best_name} ({best_conf:.2f}% confidence)",
-                    icon=":material/warning:",
+                # Exact same preprocessing & prediction logic as before
+                img_resized = image.resize((128, 128))
+                img_array = np.array(img_resized, dtype=np.float32)
+                img_array = np.expand_dims(img_array, axis=0)
+
+                with st.spinner("Analyzing leaf..."):
+                    preds = model.predict(img_array, verbose=0)[0]
+
+                top_3_indices = np.argsort(preds)[-3:][::-1]
+                best_raw_name = CLASS_NAMES[top_3_indices[0]]
+                best_name = format_label(best_raw_name)
+                best_conf = preds[top_3_indices[0]] * 100
+                is_healthy = "healthy" in best_raw_name.lower()
+                details = DISEASE_INFO.get(
+                    best_raw_name,
+                    {
+                        "info": "No additional description available.",
+                        "tip": "Consult a local agricultural extension for detailed guidance.",
+                    },
                 )
 
-            if best_conf < 60:
-                st.warning(
-                    "Low confidence (< 60%). For a more reliable result, try a clear close-up leaf photo on a plain background.",
-                    icon=":material/info:",
+                st.markdown("#### Diagnosis Result")
+
+                if is_healthy:
+                    st.success(
+                        f"**Healthy:** {best_name} ({best_conf:.2f}% confidence)",
+                        icon=":material/check_circle:",
+                    )
+                else:
+                    st.error(
+                        f"**Disease Detected:** {best_name} ({best_conf:.2f}% confidence)",
+                        icon=":material/warning:",
+                    )
+
+                if best_conf < 60:
+                    st.warning(
+                        "Low confidence (< 60%). For a more reliable result, try a clear close-up leaf photo on a plain background.",
+                        icon=":material/info:",
+                    )
+
+                st.markdown("##### Top 3 Probabilities")
+                top_3_lines = []
+                for idx in top_3_indices:
+                    clean_name = format_label(CLASS_NAMES[idx])
+                    prob_pct = preds[idx] * 100
+                    top_3_lines.append(f"- {clean_name}: {prob_pct:.2f}%")
+                    st.markdown(f"**{clean_name}** ({prob_pct:.2f}%)")
+                    st.progress(float(preds[idx]))
+
+                with st.expander(
+                    ":material/healing: Disease Insight & Care Tip", expanded=False
+                ):
+                    st.markdown(f"**About:** {details['info']}")
+                    st.markdown(f"**Care Tip:** {details['tip']}")
+
+                # Build downloadable .txt diagnosis summary
+                report_text = (
+                    f"Plant Leaf Disease Detection Report\n"
+                    f"===================================\n"
+                    f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Image: {image_caption}\n\n"
+                    f"Primary Diagnosis: {best_name}\n"
+                    f"Status: {'Healthy' if is_healthy else 'Disease Detected'}\n"
+                    f"Confidence: {best_conf:.2f}%\n\n"
+                    f"Top 3 Probabilities:\n"
+                    + "\n".join(top_3_lines)
+                    + f"\n\nAbout:\n{details['info']}\n\n"
+                    f"Recommended Care Tip:\n{details['tip']}\n"
                 )
 
-            st.markdown("##### Top 3 Probabilities")
-            top_3_lines = []
-            for idx in top_3_indices:
-                clean_name = format_label(CLASS_NAMES[idx])
-                prob_pct = preds[idx] * 100
-                top_3_lines.append(f"- {clean_name}: {prob_pct:.2f}%")
-                st.markdown(f"**{clean_name}** ({prob_pct:.2f}%)")
-                st.progress(float(preds[idx]))
-
-            with st.expander(
-                ":material/healing: Disease Insight & Care Tip", expanded=False
-            ):
-                st.markdown(f"**About:** {details['info']}")
-                st.markdown(f"**Care Tip:** {details['tip']}")
-
-            # Build downloadable .txt diagnosis summary
-            report_text = (
-                f"Plant Leaf Disease Detection Report\n"
-                f"===================================\n"
-                f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"Image: {image_caption}\n\n"
-                f"Primary Diagnosis: {best_name}\n"
-                f"Status: {'Healthy' if is_healthy else 'Disease Detected'}\n"
-                f"Confidence: {best_conf:.2f}%\n\n"
-                f"Top 3 Probabilities:\n"
-                + "\n".join(top_3_lines)
-                + f"\n\nAbout:\n{details['info']}\n\n"
-                f"Recommended Care Tip:\n{details['tip']}\n"
-            )
-
-            st.download_button(
-                label=":material/download: Download Diagnosis Report (.txt)",
-                data=report_text,
-                file_name=f"leaf_diagnosis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
+                st.download_button(
+                    label=":material/download: Download Diagnosis Report (.txt)",
+                    data=report_text,
+                    file_name=f"leaf_diagnosis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
 else:
     st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
     g1, g2, g3 = st.columns(3, gap="medium")
